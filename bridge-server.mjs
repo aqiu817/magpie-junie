@@ -51,17 +51,49 @@ const JUNIE = process.env.JUNIE_BIN ?? "C:\\Users\\Robin\\.local\\bin\\junie.bat
 const MODEL = process.env.JUNIE_MODEL ?? "junie-lite"
 const TIMEOUT_MS = Number(process.env.JUNIE_TIMEOUT_MS ?? 120_000)
 
-/** OpenAI messages → 单个 prompt 文本（保留角色语义） */
-export function messagesToPrompt(messages) {
-  if (!Array.isArray(messages)) return ""
-  return messages.map((m) => {
+/**
+ * OpenAI messages + tools → 单个 prompt 文本。
+ *
+ * 工具处理（B 方案）：CLI headless 的 JSON 输出只有 6 个字段，没有 tool_calls，
+ * 无法做标准 function calling（模型返回 tool_calls 给客户端执行）。但 CLI 内置
+ * websearch/grep 等工具能自己执行并把结果写进答案。因此把 OpenAI tools 转成
+ * "可用工具"说明注入 prompt，引导 CLI 用内置能力完成任务；tool role 的历史消息
+ * 转成"工具执行结果"段落，保证多轮上下文不丢。
+ */
+export function messagesToPrompt(messages, tools) {
+  const parts = []
+  if (Array.isArray(tools) && tools.length) {
+    const names = tools.map((t) => t?.function?.name ?? t?.name).filter(Boolean)
+    if (names.length) {
+      parts.push([
+        "## 可用工具",
+        "用户请求中提供了以下工具，请利用你自己的内置能力完成对应任务（联网搜索请用 websearch）：",
+        names.map((n) => `- ${n}`).join("\n"),
+        "若需要搜索/查资料，请实际执行搜索并给出带来源的结果，不要只说“已检索”。",
+      ].join("\n"))
+    }
+  }
+  for (const m of (Array.isArray(messages) ? messages : [])) {
+    const role = m?.role ?? "user"
+    if (role === "tool") {
+      let content = m?.content ?? ""
+      if (Array.isArray(content)) content = content.map((p) => p?.text ?? "").join("\n")
+      parts.push(`## 工具执行结果${m?.tool_call_id ? ` (${m.tool_call_id})` : ""}\n${content}`)
+      continue
+    }
+    if (role === "assistant" && Array.isArray(m?.tool_calls) && m.tool_calls.length) {
+      const calls = m.tool_calls.map((tc) =>
+        `- ${tc?.function?.name ?? tc?.name}: ${tc?.function?.arguments ?? ""}`).join("\n")
+      parts.push(`## 助手此前发起的工具调用\n${calls}`)
+      continue
+    }
     let content = m?.content ?? ""
     if (Array.isArray(content)) content = content.map((p) => p?.text ?? "").join("\n")
-    const role = m?.role ?? "user"
-    if (role === "system") return `## 系统指令\n${content}`
-    if (role === "assistant") return `## 助手此前回复\n${content}`
-    return `## 用户\n${content}`
-  }).join("\n\n")
+    if (role === "system") parts.push(`## 系统指令\n${content}`)
+    else if (role === "assistant") parts.push(`## 助手此前回复\n${content}`)
+    else parts.push(`## 用户\n${content}`)
+  }
+  return parts.join("\n\n")
 }
 
 /**
@@ -235,7 +267,7 @@ export function createBridgeServer() {
         const body = JSON.parse(Buffer.concat(chunks).toString("utf8"))
         // 每次对话前按需检查版本（6h 节流），确保 CLI 不被上游版本门槛卡住。
         await maybeUpdate()
-        const prompt = messagesToPrompt(body.messages)
+        const prompt = messagesToPrompt(body.messages, body.tools)
         const { result, errors, llmUsage } = await callJunie(prompt, { model: body.model && body.model !== "junie-lite" ? MODEL : MODEL })
         if (errors.length) {
           res.writeHead(400, { "Content-Type": "application/json" })
@@ -279,8 +311,8 @@ export function createBridgeServer() {
   })
 }
 
-// 直接运行时启动服务（ESM 入口检测）
-if (process.argv[1] && import.meta.url === new URL(`file:///${process.argv[1].replace(/\\/g, "/")}`).href) {
+// 直接运行时启动服务（Linux 上 import.meta 入口检测可能失效，用显式开关兜底）
+if (process.env.JUNIE_BRIDGE_SERVE === "1" || (process.argv[1] && import.meta.url === new URL(`file:///${process.argv[1].replace(/\\/g, "/")}`).href)) {
   const server = createBridgeServer()
   server.listen(PORT, HOST, () => {
     console.log(`junie-openai bridge listening on http://${HOST}:${PORT}/v1 (model=${MODEL})`)

@@ -107,3 +107,26 @@ test("streamChunks includes usage chunk before DONE", () => {
   assert.match(sse, /"usage":\{"prompt_tokens":12,"completion_tokens":6,"total_tokens":18\}/)
   assert.ok(sse.indexOf('"usage"') < sse.indexOf("data: [DONE]"))
 })
+
+
+test("messagesToPrompt injects tool definitions and asks for real execution", () => {
+  const prompt = messagesToPrompt(
+    [{ role: "user", content: "搜索今天的新闻" }],
+    [{ type: "function", function: { name: "web_search", parameters: {} } }],
+  )
+  assert.match(prompt, /## 可用工具/)
+  assert.match(prompt, /web_search/)
+  assert.match(prompt, /实际执行搜索/)
+  assert.match(prompt, /## 用户\n搜索今天的新闻/)
+})
+
+test("messagesToPrompt preserves tool results and assistant tool_calls history", () => {
+  const prompt = messagesToPrompt([
+    { role: "assistant", tool_calls: [{ function: { name: "web_search", arguments: '{"q":"news"}' } }] },
+    { role: "tool", tool_call_id: "call_1", content: "搜索结果：今天有新闻" },
+    { role: "user", content: "总结上面结果" },
+  ])
+  assert.match(prompt, /## 助手此前发起的工具调用/)
+  assert.match(prompt, /web_search: \{"q":"news"\}/)
+  assert.match(prompt, /## 工具执行结果 \(call_1\)\n搜索结果：今天有新闻/)
+})

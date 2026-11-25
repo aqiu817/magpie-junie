@@ -1,6 +1,6 @@
 {
   "name": "magpie-junie",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "OpenCode provider plugin: JetBrains Junie for magpie (CLI credential reuse, browser PKCE, API key)",
   "type": "module",
   "main": "./index.mjs",
