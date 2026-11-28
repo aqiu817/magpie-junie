@@ -4,6 +4,7 @@ import assert from "node:assert/strict"
 import {
   OPENAI_MODEL_MAP, resolveOpenAIModelId, isAnthropicModel, isOpenAIModel,
   passthroughHeaders, sanitizePayload, sanitizeSystem, ANTHROPIC_FIELDS, OPENAI_FIELDS,
+  currentCliVersion, defaultGrazieAgent,
 } from "../lib/constants.mjs"
 import { MODELS, configModels, routeOf } from "../lib/models.mjs"
 
@@ -33,10 +34,17 @@ test("passthrough headers: auth + fixed grab headers; free-google in standard mo
 
 test("passthrough headers: free license adds forced-free trio", () => {
   const h = passthroughHeaders("T", { license: "free" })
-  assert.equal(h["X-Forced-License-Free"], "true")
+  // 值必须是协议版本号 "2"（FORCED_LICENSE_FREE_VERSION）；"true" 会被上游判旧客户端。
+  assert.equal(h["X-Forced-License-Free"], "2")
   assert.equal(h["X-Accept-EAP-License"], "false")
   assert.equal(h["X-Accept-Release-License"], "false")
   assert.equal("X-Free-Google-Api" in h, false)
+})
+
+test("default Grazie-Agent follows the installed CLI version", () => {
+  const v = currentCliVersion()
+  assert.match(v, /^\d+(\.\d+)+$/)
+  assert.deepEqual(JSON.parse(defaultGrazieAgent()), { name: "junie:cli", version: `${v}:${v}` })
 })
 
 test("free-google toggle by version option", () => {

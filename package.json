@@ -1,7 +1,7 @@
 {
   "name": "magpie-junie",
-  "version": "0.1.4",
-  "description": "OpenCode provider plugin: JetBrains Junie for magpie (CLI credential reuse, browser PKCE, API key)",
+  "version": "0.1.5",
+  "description": "OpenCode provider plugin: JetBrains Junie for magpie (free-tier gpt-6-luna with native tool calls, CLI credential reuse, browser PKCE, API key)",
   "type": "module",
   "main": "./index.mjs",
   "bin": {
@@ -39,8 +39,8 @@
     "icon": "data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2024%2024'%3E%3Crect%20width='24'%20height='24'%20rx='5'%20fill='%23000'%2F%3E%3Cpath%20fill='%23fff'%20d='M6%206h3l6%206V6h3v12h-3L9%2012v6H6z'/%3E%3C%2Fsvg%3E",
     "maxConcurrency": 2,
     "summary": {
-      "en": "Use your JetBrains Junie subscription in magpie. Reuse the local CLI login, browser PKCE, or a perm-* key.",
-      "zh": "在 magpie 中使用 JetBrains Junie：复用本机 CLI 登录态、浏览器登录或 perm-* API key。"
+      "en": "Use your JetBrains Junie free tier in magpie with native OpenAI tool calls. Reuse the local CLI login, browser PKCE, or a perm-* key.",
+      "zh": "在 magpie 中使用 JetBrains Junie free tier，支持原生 OpenAI 工具调用：复用本机 CLI 登录态、浏览器登录或 perm-* API key。"
     }
   },
   "publishConfig": {

@@ -19,10 +19,14 @@
 
 import { createServer } from "node:http"
 import { spawn } from "node:child_process"
-import { closeSync, mkdtempSync, openSync, rmSync, writeFileSync } from "node:fs"
-import { tmpdir } from "node:os"
+import { closeSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { homedir, tmpdir } from "node:os"
 import { join } from "node:path"
 import { checkAndUpdate } from "./lib/auto-update.mjs"
+import { readCliCredentials } from "./lib/credentials.mjs"
+import { refreshAccessToken } from "./lib/auth.mjs"
+import { proxyFetch } from "./lib/proxy.mjs"
+import { chatToResponses, createStreamConverter, responsesToChat, RESPONSES_PATH } from "./lib/responses.mjs"
 
 const AUTO_UPDATE = process.env.JUNIE_AUTO_UPDATE !== "off" // 默认开
 const UPDATE_INTERVAL_MS = Number(process.env.JUNIE_UPDATE_INTERVAL_MS ?? 6 * 60 * 60 * 1000)
@@ -50,6 +54,15 @@ const HOST = process.env.HOST ?? "127.0.0.1"
 const JUNIE = process.env.JUNIE_BIN ?? "C:\\Users\\Robin\\.local\\bin\\junie.bat"
 const MODEL = process.env.JUNIE_MODEL ?? "junie-lite"
 const TIMEOUT_MS = Number(process.env.JUNIE_TIMEOUT_MS ?? 120_000)
+
+// 后端选择：
+//   direct（默认）：直连 Ingrazzio /v1/responses（gpt-6-luna），原生 function_call → tool_calls
+//   cli：调 CLI headless（CLI 自己执行工具，无 tool_calls 字段）
+const BACKEND = process.env.JUNIE_BACKEND ?? "direct"
+const UPSTREAM_BASE = process.env.JUNIE_UPSTREAM ?? "https://ingrazzio-cloud-prod.labs.jb.gg"
+/** 上游认的模型 wire name（junie-lite 在 26.11.3 映射到 gpt-6-luna）。 */
+const DIRECT_MODEL = process.env.JUNIE_DIRECT_MODEL ?? "gpt-6-luna"
+const DIRECT_TIMEOUT_MS = Number(process.env.JUNIE_DIRECT_TIMEOUT_MS ?? 180_000)
 
 /**
  * OpenAI messages + tools → 单个 prompt 文本。
@@ -216,6 +229,133 @@ export function usageFromLlmUsage(llmUsage) {
   }
 }
 
+/**
+ * 当前 CLI 版本（`~/.local/share/junie/current` 里就是版本号，如 "4171.6"）。
+ * 上游用 Grazie-Agent 的版本判定客户端新旧：旧版本对 free 模型返回 400 UPDATE_REQUIRED。
+ * 动态跟随 CLI 版本，避免 CLI 升级后桥接被同一道门槛卡住。
+ */
+export function cliVersion() {
+  try {
+    const v = readFileSync(join(homedir(), ".local", "share", "junie", "current"), "utf8").trim()
+    if (/^\d+(\.\d+)+$/.test(v)) return v
+  } catch { /* 没装 CLI：用已知可用版本兜底 */ }
+  return "4171.6"
+}
+
+/**
+ * Ingrazzio 直连头。关键实证（反编译 IngrazzioLicenseHeadersKt.class）：
+ *   - X-Forced-License-Free 的值是协议版本号 "2"；用 "true" 会被判旧客户端 → UPDATE_REQUIRED
+ *   - Grazie-Agent 的 version 必须是当前 CLI 版本（"<v>:<v>"）
+ *   - Free 分支还会清掉配置里同名的 license 头，再统一设 false/false
+ */
+export function directHeaders(token, version = cliVersion()) {
+  return {
+    "Authorization": `Bearer ${token}`,
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+    "Grazie-Agent": JSON.stringify({ name: "junie:cli", version: `${version}:${version}` }),
+    "X-LLM-Model": "openai",
+    "X-Keep-Path": "true",
+    "X-Forced-License-Free": "2",
+    "X-Accept-EAP-License": "false",
+    "X-Accept-Release-License": "false",
+  }
+}
+
+// 直连模式的凭据缓存（id_token 作 Bearer；过期前自动 refresh）
+let directAuthCache = null
+
+/**
+ * 直连模式的上游凭据：JUNIE_TOKEN 环境变量优先，否则复用本机 CLI 登录态并自动续期。
+ * 失败时抛带 status 的错误，由调用方转成 HTTP 响应。
+ */
+export async function directAuth() {
+  const envToken = process.env.JUNIE_TOKEN?.trim()
+  if (envToken) return { access: envToken }
+  const now = Date.now()
+  if (directAuthCache && (directAuthCache.expires ?? 0) - now > 120_000) return directAuthCache
+  let auth = directAuthCache
+  if (!auth) {
+    const cred = await readCliCredentials()
+    if (!cred.ok) {
+      throw Object.assign(
+        new Error(`读不到 Junie 登录态（${cred.reason}）。请先在本机登录 Junie CLI，或设置 JUNIE_TOKEN 环境变量。`),
+        { status: 401 },
+      )
+    }
+    auth = cred.auth
+  }
+  if ((auth.expires ?? 0) - now < 120_000 && auth.refresh) {
+    const refreshed = await refreshAccessToken(auth)
+    if (refreshed) auth = { ...auth, ...refreshed }
+  }
+  directAuthCache = auth
+  return auth
+}
+
+/** 逐事件解析上游 SSE（`data: {json}` 块，事件之间用空行分隔，可能是 \n\n 或 \r\n\r\n）。 */
+export async function* sseEvents(body) {
+  let buf = ""
+  for await (const chunk of body) {
+    // Node/Bun 的 fetch body chunk 是 Uint8Array（不是 Buffer），必须显式转换；
+    // String(uint8array) 会得到 "123,45,..." 这样的数字串，SSE 就永远解析不出来。
+    buf += typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8")
+    let m
+    while ((m = /\r?\n\r?\n/.exec(buf))) {
+      const block = buf.slice(0, m.index)
+      buf = buf.slice(m.index + m[0].length)
+      const data = block
+        .split(/\r?\n/)
+        .filter((line) => line.startsWith("data:"))
+        .map((line) => line.slice(5).trim())
+        .join("\n")
+      if (!data) continue
+      try { yield JSON.parse(data) } catch { /* 非 JSON 的 data 行忽略 */ }
+    }
+  }
+  // 收尾：最后一块可能没有结尾空行
+  const tail = buf.split(/\r?\n/).filter((line) => line.startsWith("data:")).map((line) => line.slice(5).trim()).join("\n")
+  if (tail) {
+    try { yield JSON.parse(tail) } catch { /* 忽略 */ }
+  }
+}
+
+/**
+ * 直连模式：OpenAI chat completions → Ingrazzio /v1/responses → 转回 chat completions。
+ * tools 原样透传（上游原生返回 function_call，harness 自己执行工具）。
+ */
+async function handleDirect(req, res, body) {
+  const replyModel = body.model ?? MODEL
+  const auth = await directAuth()
+  const payload = chatToResponses(body, { model: DIRECT_MODEL })
+  if (body.stream) payload.stream = true
+  const upstream = await proxyFetch(`${UPSTREAM_BASE}${RESPONSES_PATH}`, {
+    method: "POST",
+    headers: directHeaders(auth.access),
+    body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(DIRECT_TIMEOUT_MS),
+  })
+  if (!upstream.ok) {
+    const text = await upstream.text().catch(() => "")
+    res.writeHead(upstream.status, { "Content-Type": "application/json" })
+    res.end(JSON.stringify({ error: { message: text.slice(0, 1200) || `upstream HTTP ${upstream.status}`, type: "upstream_error", status: upstream.status } }))
+    return
+  }
+  const ctype = upstream.headers.get("content-type") ?? ""
+  if (body.stream && ctype.includes("text/event-stream") && upstream.body) {
+    res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" })
+    const converter = createStreamConverter(replyModel)
+    for await (const event of sseEvents(upstream.body)) {
+      for (const out of converter.feed(event)) res.write(out)
+    }
+    res.end()
+    return
+  }
+  const json = await upstream.json()
+  res.writeHead(200, { "Content-Type": "application/json" })
+  res.end(JSON.stringify(responsesToChat(json, replyModel)))
+}
+
 /** OpenAI chat completion 响应体 */
 export function completionBody(result, model, usage) {
   return {
@@ -265,6 +405,10 @@ export function createBridgeServer() {
         const chunks = []
         for await (const c of req) chunks.push(c)
         const body = JSON.parse(Buffer.concat(chunks).toString("utf8"))
+        if (BACKEND === "direct") {
+          await handleDirect(req, res, body)
+          return
+        }
         // 每次对话前按需检查版本（6h 节流），确保 CLI 不被上游版本门槛卡住。
         await maybeUpdate()
         const prompt = messagesToPrompt(body.messages, body.tools)
@@ -282,6 +426,7 @@ export function createBridgeServer() {
           res.end(streamChunks(answer, replyModel, usage))
         } else {
           res.writeHead(200, { "Content-Type": "application/json" })
+          
           res.end(JSON.stringify(completionBody(answer, replyModel, usage)))
         }
         return
@@ -290,9 +435,12 @@ export function createBridgeServer() {
         res.writeHead(200, { "Content-Type": "application/json" })
         res.end(JSON.stringify({
           ok: true,
+          backend: BACKEND,
           model: MODEL,
+          directModel: BACKEND === "direct" ? DIRECT_MODEL : undefined,
+          cliVersion: cliVersion(),
           bin: JUNIE,
-          autoUpdate: AUTO_UPDATE,
+          autoUpdate: BACKEND === "direct" ? false : AUTO_UPDATE,
           lastUpdate: lastUpdateInfo && {
             checked: lastUpdateInfo.checked,
             updated: lastUpdateInfo.updated,
@@ -315,7 +463,7 @@ export function createBridgeServer() {
 if (process.env.JUNIE_BRIDGE_SERVE === "1" || (process.argv[1] && import.meta.url === new URL(`file:///${process.argv[1].replace(/\\/g, "/")}`).href)) {
   const server = createBridgeServer()
   server.listen(PORT, HOST, () => {
-    console.log(`junie-openai bridge listening on http://${HOST}:${PORT}/v1 (model=${MODEL})`)
-    maybeUpdate() // 启动后后台检查一次（6h 节流），不阻塞服务可用
+    console.log(`junie-openai bridge listening on http://${HOST}:${PORT}/v1 (backend=${BACKEND}, model=${MODEL}${BACKEND === "direct" ? ` → ${DIRECT_MODEL}` : ""})`)
+    if (BACKEND !== "direct") maybeUpdate() // CLI 后端才需要保鲜版本；启动后后台检查一次（6h 节流），不阻塞服务可用
   })
 }
