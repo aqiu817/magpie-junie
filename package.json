@@ -1,6 +1,6 @@
 {
   "name": "magpie-junie",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "OpenCode provider plugin: JetBrains Junie for magpie (free-tier gpt-6-luna with native tool calls, CLI credential reuse, browser PKCE, API key)",
   "type": "module",
   "main": "./index.mjs",

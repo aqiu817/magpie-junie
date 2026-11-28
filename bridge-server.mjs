@@ -19,11 +19,12 @@
 
 import { createServer } from "node:http"
 import { spawn } from "node:child_process"
-import { closeSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { closeSync, mkdtempSync, openSync, rmSync, writeFileSync } from "node:fs"
 import { homedir, tmpdir } from "node:os"
 import { join } from "node:path"
 import { checkAndUpdate } from "./lib/auto-update.mjs"
-import { readCliCredentials } from "./lib/credentials.mjs"
+import { readAnyCredentials } from "./lib/credentials.mjs"
+import { currentCliVersion } from "./lib/constants.mjs"
 import { refreshAccessToken } from "./lib/auth.mjs"
 import { proxyFetch } from "./lib/proxy.mjs"
 import { chatToResponses, createStreamConverter, responsesToChat, RESPONSES_PATH } from "./lib/responses.mjs"
@@ -51,7 +52,11 @@ async function maybeUpdate() {
 
 const PORT = Number(process.env.PORT ?? 4141)
 const HOST = process.env.HOST ?? "127.0.0.1"
-const JUNIE = process.env.JUNIE_BIN ?? "C:\\Users\\Robin\\.local\\bin\\junie.bat"
+// CLI 可执行文件默认路径按平台判断（Linux/服务器不需要手工改代码）。
+const DEFAULT_JUNIE_BIN = process.platform === "win32"
+  ? "C:\\Users\\Robin\\.local\\bin\\junie.bat"
+  : join(homedir(), ".local", "bin", "junie")
+const JUNIE = process.env.JUNIE_BIN ?? DEFAULT_JUNIE_BIN
 const MODEL = process.env.JUNIE_MODEL ?? "junie-lite"
 const TIMEOUT_MS = Number(process.env.JUNIE_TIMEOUT_MS ?? 120_000)
 
@@ -230,16 +235,12 @@ export function usageFromLlmUsage(llmUsage) {
 }
 
 /**
- * 当前 CLI 版本（`~/.local/share/junie/current` 里就是版本号，如 "4171.6"）。
+ * 当前 CLI 版本（Windows 读文本文件，Linux 读 versions/<ver> 符号链接）。
  * 上游用 Grazie-Agent 的版本判定客户端新旧：旧版本对 free 模型返回 400 UPDATE_REQUIRED。
  * 动态跟随 CLI 版本，避免 CLI 升级后桥接被同一道门槛卡住。
  */
 export function cliVersion() {
-  try {
-    const v = readFileSync(join(homedir(), ".local", "share", "junie", "current"), "utf8").trim()
-    if (/^\d+(\.\d+)+$/.test(v)) return v
-  } catch { /* 没装 CLI：用已知可用版本兜底 */ }
-  return "4171.6"
+  return currentCliVersion()
 }
 
 /**
@@ -267,6 +268,7 @@ let directAuthCache = null
 
 /**
  * 直连模式的上游凭据：JUNIE_TOKEN 环境变量优先，否则复用本机 CLI 登录态并自动续期。
+ * Windows 走 DPAPI；Linux/服务器回退 ~/.junie/secure_credentials.json。
  * 失败时抛带 status 的错误，由调用方转成 HTTP 响应。
  */
 export async function directAuth() {
@@ -276,7 +278,7 @@ export async function directAuth() {
   if (directAuthCache && (directAuthCache.expires ?? 0) - now > 120_000) return directAuthCache
   let auth = directAuthCache
   if (!auth) {
-    const cred = await readCliCredentials()
+    const cred = await readAnyCredentials()
     if (!cred.ok) {
       throw Object.assign(
         new Error(`读不到 Junie 登录态（${cred.reason}）。请先在本机登录 Junie CLI，或设置 JUNIE_TOKEN 环境变量。`),

@@ -1,6 +1,9 @@
 // 常量 / 纯函数：对照 junie-api v0.3.1 源码
 import test from "node:test"
 import assert from "node:assert/strict"
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 import {
   OPENAI_MODEL_MAP, resolveOpenAIModelId, isAnthropicModel, isOpenAIModel,
   passthroughHeaders, sanitizePayload, sanitizeSystem, ANTHROPIC_FIELDS, OPENAI_FIELDS,
@@ -45,6 +48,37 @@ test("default Grazie-Agent follows the installed CLI version", () => {
   const v = currentCliVersion()
   assert.match(v, /^\d+(\.\d+)+$/)
   assert.deepEqual(JSON.parse(defaultGrazieAgent()), { name: "junie:cli", version: `${v}:${v}` })
+})
+
+test("currentCliVersion reads a plain version file (Windows layout)", () => {
+  const dir = mkdtempSync(join(tmpdir(), "junie-ver-"))
+  try {
+    const p = join(dir, "current")
+    writeFileSync(p, "4171.6", "utf8")
+    assert.equal(currentCliVersion(p), "4171.6")
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("currentCliVersion follows a versions/<ver> symlink (Linux layout)", (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "junie-ver-"))
+  try {
+    mkdirSync(join(dir, "versions", "4171.6"), { recursive: true })
+    const link = join(dir, "current")
+    try {
+      symlinkSync(join(dir, "versions", "4171.6"), link)
+    } catch {
+      return t.skip("platform does not allow creating symlinks")
+    }
+    assert.equal(currentCliVersion(link), "4171.6")
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("currentCliVersion falls back when the path is missing", () => {
+  assert.match(currentCliVersion("Z:/no-such-junie/current"), /^\d+(\.\d+)+$/)
 })
 
 test("free-google toggle by version option", () => {
